@@ -31,7 +31,7 @@ class PillowIRProcessor:
         return palette
 
     def process(self, pixels, width, height, threshold, decay, enable_trail):
-        # 変換負荷を抑えるため、即座にリサイズ
+        # 15fps動作に合わせたPIL軽量処理
         img = PILImage.frombytes('RGBA', (width, height), pixels)
         img = img.resize((320, 240), PILImage.NEAREST)
         
@@ -56,28 +56,23 @@ class PillowIRProcessor:
 class IRMetalApp(App):
     def build(self):
         self.processor = PillowIRProcessor()
-        # [修正点] GPUメモリリークを防ぐため、Textureを使い回す
         self._camera_texture = None 
-        
-        if platform == 'android':
-            from android.permissions import request_permissions, Permission
-            request_permissions([Permission.CAMERA])
+        self.camera = None
+        self.error_count = 0 # ログスパム防止用
 
         self.root = BoxLayout(orientation='vertical', padding=20, spacing=15)
-        self.root.add_widget(Label(text="IR VISION - LIGHTWEIGHT", size_hint_y=0.1, bold=True, font_size='22sp'))
+        self.root.add_widget(Label(text="IR VISION - PRO", size_hint_y=0.1, bold=True, font_size='22sp'))
         
         self.img_widget = KivyImage(size_hint_y=0.6)
         self.root.add_widget(self.img_widget)
-
-        self.camera = Camera(play=True, resolution=(640, 480))
         
         ctrl_panel = BoxLayout(orientation='vertical', size_hint_y=0.3, spacing=5)
         
-        ctrl_panel.add_widget(Label(text="SENSITIVITY (Threshold)", font_size='14sp', color=(0.8, 0.8, 0.8, 1)))
+        ctrl_panel.add_widget(Label(text="SENSITIVITY", font_size='14sp', color=(0.8, 0.8, 0.8, 1)))
         self.sens_slider = Slider(min=100, max=255, value=220, cursor_image='knob.png', cursor_size=(40, 40))
         ctrl_panel.add_widget(self.sens_slider)
 
-        ctrl_panel.add_widget(Label(text="AFTERIMAGE TRAIL (Decay)", font_size='14sp', color=(0.8, 0.8, 0.8, 1)))
+        ctrl_panel.add_widget(Label(text="AFTERIMAGE TRAIL", font_size='14sp', color=(0.8, 0.8, 0.8, 1)))
         self.trail_slider = Slider(min=0.01, max=0.3, value=0.15, cursor_image='knob.png', cursor_size=(40, 40))
         ctrl_panel.add_widget(self.trail_slider)
 
@@ -85,11 +80,28 @@ class IRMetalApp(App):
         ctrl_panel.add_widget(self.effect_toggle)
         self.root.add_widget(ctrl_panel)
 
-        Clock.schedule_interval(self.update, 1.0 / 30.0)
+        # 確実な権限コールバックによるカメラ遅延起動
+        if platform == 'android':
+            from android.permissions import request_permissions, Permission
+            def permission_callback(permissions, grants):
+                if grants and grants[0]:
+                    Clock.schedule_once(self.init_camera, 0.5)
+                else:
+                    Logger.warning("IRVision: Camera permission denied by user.")
+            
+            request_permissions([Permission.CAMERA], permission_callback)
+        else:
+            Clock.schedule_once(self.init_camera, 0.5)
+
+        # 30fps -> 15fpsへのデチューン (発熱・バッテリー枯渇対策)
+        Clock.schedule_interval(self.update, 1.0 / 15.0)
         return self.root
 
+    def init_camera(self, dt):
+        self.camera = Camera(play=True, resolution=(320, 240))
+
     def update(self, dt):
-        if not self.camera.texture: return
+        if not self.camera or not self.camera.texture: return
         try:
             w, h = self.camera.texture.width, self.camera.texture.height
             pixels = self.camera.texture.pixels
@@ -103,16 +115,26 @@ class IRMetalApp(App):
             processed_pil = processed_pil.transpose(PILImage.FLIP_TOP_BOTTOM)
             buf = processed_pil.tobytes()
             
-            # [修正点] 毎フレーム生成せず、既存のテクスチャを上書き更新
             if self._camera_texture is None or self._camera_texture.size != processed_pil.size:
-                self._camera_texture = Texture.create(size=processed_pil.size, colorfmt='rgb')
+                # mipmapエラー回避のため bufferfmt='ubyte' を明示
+                self._camera_texture = Texture.create(size=processed_pil.size, colorfmt='rgb', bufferfmt='ubyte')
             
             self._camera_texture.blit_buffer(buf, colorfmt='rgb', bufferfmt='ubyte')
             self.img_widget.texture = self._camera_texture
             
+            # 正常に1フレーム処理できたらエラーカウントをリセット
+            self.error_count = 0 
+            
         except Exception as e:
-            # [修正点] エラーの握り潰しをやめ、実機デバッグ可能なロギングに変更
-            Logger.exception(f"IRVision Frame processing error: {e}")
+            self.error_count += 1
+            if self.error_count <= 5:
+                Logger.exception(f"IRVision Frame processing error: {e}")
+
+    def on_stop(self):
+        # 確実なリソース解放 (カメラ掴みっぱなしによる次回起動失敗を防ぐ)
+        if self.camera:
+            self.camera.play = False
+            self.camera = None
 
 if __name__ == '__main__':
     IRMetalApp().run()
